@@ -1,4 +1,4 @@
-# python_pkg_template
+# nets
 
 Some sample text for the website.
 
