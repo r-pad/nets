@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.6"
 license = { file = "LICENSE.txt" }
 authors = [{ email = "baeisner@andrew.cmu.edu", name = "Ben Eisner" }]
-dependencies = []
+dependencies = ["torch"]
 
 [build-system]
 requires = ["setuptools >= 62.3.2", "setuptools-scm", "wheel"]
@@ -22,6 +22,16 @@ develop = [
     "pytest == 7.3.2",
     "pre-commit == 3.3.3",
 ]
+diptv3 = [
+    "addict",
+    "timm",
+    "torch_scatter",
+
+    # flash_attention is required, but you need special build config.
+
+    # spconv is also required, but instead of something sane it has https://github.com/traveller59/spconv
+    # where you have to install a per-cuda package. smh.
+]
 notebooks = ["jupyter"]
 build_docs = ["mkdocs-material", "mkdocstrings[python]"]
 
@@ -30,7 +40,7 @@ build_docs = ["mkdocs-material", "mkdocstrings[python]"]
 where = ["src", "third_party"]
 
 [tool.black]
-exclude = "third_party/*"
+exclude = "third_party/*,src/rpad/nets/diptv3.py"
 
 [tool.setuptools.package-data]
 rpad = ["py.typed"]
@@ -40,6 +50,7 @@ profile = "black"
 skip = ["third_party"]
 
 [tool.autoflake]
+# exclude third_party and src/rpad/nets/diptv3.py
 exclude = "third_party/*"
 
 [tool.pytest.ini_options]
@@ -47,7 +58,7 @@ addopts = "--ignore=third_party/"
 testpaths = "tests"
 
 [tool.mypy]
-python_version = 3.8
+python_version = "3.8"
 warn_return_any = true
 warn_unused_configs = true
 mypy_path = "src"
@@ -55,7 +66,15 @@ namespace_packages = true
 explicit_package_bases = true
 
 # # Uncomment this when you have imports for mypy to ignore.
-# [[tool.mypy.overrides]]
-# module = [
-# ]
-# ignore_missing_imports = true
+[[tool.mypy.overrides]]
+module = [
+    "addict.*",
+    "PointTransformerV3.*",
+    "spconv.*",
+    "timm.*",
+    "torch_scatter.*",
+]
+ignore_missing_imports = true
+
+[tool.pyright]
+extraPaths = ['./third_party']
