@@ -27,13 +27,24 @@ build_docs = ["mkdocs-material", "mkdocstrings[python]"]
 
 # This is required to allow us to have notebooks/ at the top level.
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "third_party"]
+
+[tool.black]
+exclude = "third_party/*"
 
 [tool.setuptools.package-data]
 rpad = ["py.typed"]
 
 [tool.isort]
 profile = "black"
+skip = ["third_party"]
+
+[tool.autoflake]
+exclude = "third_party/*"
+
+[tool.pytest.ini_options]
+addopts = "--ignore=third_party/"
+testpaths = "tests"
 
 [tool.mypy]
 python_version = 3.8

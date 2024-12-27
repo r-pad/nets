@@ -17,11 +17,11 @@ If you want to use the architecutres as-is (or their building blocks), you can j
 
 ````bash
 
-pip install git+hhttps://github.com/r-pad/nets.git#egg=nets@master
+pip install git+hhttps://github.com/r-pad/nets.git#egg=nets@main
 
 ````
 
-You can replace `master` with a specific branch or tag.
+You can replace `main` with a specific branch or tag.
 
 ## Option 2: Need to be able to modify the code.
 
