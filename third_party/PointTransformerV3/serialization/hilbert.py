@@ -140,7 +140,7 @@ def encode(locs, num_dims, num_bits):
 
     # Treat the location integers as 64-bit unsigned and then split them up into
     # a sequence of uint8s.  Preserve the association by dimension.
-    locs_uint8 = locs.long().view(torch.uint8).reshape((-1, num_dims, 8)).flip(-1)
+    locs_uint8 = locs.long().contiguous().view(torch.uint8).reshape((-1, num_dims, 8)).flip(-1)
 
     # Now turn these into bits and truncate to num_bits.
     gray = (

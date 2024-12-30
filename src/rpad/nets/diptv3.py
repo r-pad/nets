@@ -1,10 +1,12 @@
 import math
 from functools import partial
+from typing import Optional
 
 import spconv.pytorch as spconv
 import torch
 import torch_scatter
 from addict import Dict
+from DiT.models import TimestepEmbedder
 from PointTransformerV3.model import (
     MLP,
     Embedding,
@@ -19,7 +21,7 @@ from timm.layers import DropPath
 from torch import nn
 
 
-class SerializedPooling(PointModule):
+class DiPTv3SerializedPooling(PointModule):
     def __init__(
         self,
         in_channels,
@@ -60,7 +62,7 @@ class SerializedPooling(PointModule):
             "serialized_depth",
         }.issubset(
             point.keys()
-        ), "Run point.serialization() point cloud before SerializedPooling"
+        ), "Run point.serialization() point cloud before DiPTv3SerializedPooling"
 
         code = point.serialized_code >> pooling_depth * 3
         code_, cluster, counts = torch.unique(
@@ -106,6 +108,10 @@ class SerializedPooling(PointModule):
             serialized_inverse=inverse,
             serialized_depth=point.serialized_depth - pooling_depth,
             batch=point.batch[head_indices],
+            # For DiPTv3: keep track of these as well.
+            t=point.t,
+            N=point.N,
+            t_emb=point.t_emb,
         )
 
         if "condition" in point.keys():
@@ -125,12 +131,13 @@ class SerializedPooling(PointModule):
         return point
 
 
-class Block(PointModule):
+class DiPTv3Block(PointModule):
     def __init__(
         self,
         channels,
         num_heads,
         patch_size=48,
+        t_hidden_size=128,
         mlp_ratio=4.0,
         qkv_bias=True,
         qk_scale=None,
@@ -150,6 +157,7 @@ class Block(PointModule):
         super().__init__()
         self.channels = channels
         self.pre_norm = pre_norm
+        assert pre_norm, "Only support pre-normalization"
 
         self.cpe = PointSequential(
             spconv.SubMConv3d(
@@ -192,30 +200,79 @@ class Block(PointModule):
             DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         )
 
+        # Adapted from the DiT paper - add adaLN modulation.
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(t_hidden_size, 6 * channels, bias=True),
+        )
+        self.t_hidden_size = t_hidden_size
+
+    @staticmethod
+    def modulate(x, shift, scale):
+        return x * (1 + scale) + shift
+
     def forward(self, point: Point):
+        # Time embedding should still be batched.
+        assert len(point.t_emb.shape) == 2
+
+        # First, compute adaLN modulation.
+        adaLN_params = self.adaLN_modulation(point.t_emb)
+
+        # Then, repeat with batching in mind.
+        adaLN_params = adaLN_params[point.batch]
+
+        # Compute the adaLN parameters.
+        (
+            shift_msa,
+            scale_msa,
+            gate_msa,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+        ) = adaLN_params.chunk(6, dim=1)
+
         shortcut = point.feat
         point = self.cpe(point)
         point.feat = shortcut + point.feat
         shortcut = point.feat
         if self.pre_norm:
             point = self.norm1(point)
-        point = self.drop_path(self.attn(point))
+
+            # Apply adaLN modulation.
+            point.feat = self.modulate(point.feat, shift_msa, scale_msa)
+
+        # Attention.
+        point = self.attn(point)
+
+        # Modulation.
+        point.feat = gate_msa * point.feat
+
+        # Residual connection.
+        point = self.drop_path(point)
         point.feat = shortcut + point.feat
-        if not self.pre_norm:
-            point = self.norm1(point)
 
         shortcut = point.feat
         if self.pre_norm:
             point = self.norm2(point)
-        point = self.drop_path(self.mlp(point))
+
+            # Apply adaLN modulation.
+            point.feat = self.modulate(point.feat, shift_mlp, scale_mlp)
+
+        # MLP.
+        point = self.mlp(point)
+
+        # Modulation.
+        point.feat = gate_mlp * point.feat
+
+        # Residual connection.
+        point = self.drop_path(point)
         point.feat = shortcut + point.feat
-        if not self.pre_norm:
-            point = self.norm2(point)
+
         point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
         return point
 
 
-class PointTransformerV3(PointModule):
+class DiPTv3(PointModule):
     def __init__(
         self,
         in_channels=6,
@@ -229,6 +286,7 @@ class PointTransformerV3(PointModule):
         dec_channels=(64, 64, 128, 256),
         dec_num_head=(4, 4, 8, 16),
         dec_patch_size=(1024, 1024, 1024, 1024),
+        t_hidden_size=128,
         mlp_ratio=4,
         qkv_bias=True,
         qk_scale=None,
@@ -254,6 +312,7 @@ class PointTransformerV3(PointModule):
         self.order = [order] if isinstance(order, str) else order
         self.cls_mode = cls_mode
         self.shuffle_orders = shuffle_orders
+        self.t_hidden_size = t_hidden_size
 
         assert self.num_stages == len(stride) + 1
         assert self.num_stages == len(enc_depths)
@@ -298,6 +357,8 @@ class PointTransformerV3(PointModule):
             act_layer=act_layer,
         )
 
+        self.t_embedder = TimestepEmbedder(t_hidden_size)
+
         # encoder
         enc_drop_path = [
             x.item() for x in torch.linspace(0, drop_path, sum(enc_depths))
@@ -310,7 +371,7 @@ class PointTransformerV3(PointModule):
             enc = PointSequential()
             if s > 0:
                 enc.add(
-                    SerializedPooling(
+                    DiPTv3SerializedPooling(
                         in_channels=enc_channels[s - 1],
                         out_channels=enc_channels[s],
                         stride=stride[s - 1],
@@ -321,10 +382,11 @@ class PointTransformerV3(PointModule):
                 )
             for i in range(enc_depths[s]):
                 enc.add(
-                    Block(
+                    DiPTv3Block(
                         channels=enc_channels[s],
                         num_heads=enc_num_head[s],
                         patch_size=enc_patch_size[s],
+                        t_hidden_size=t_hidden_size,
                         mlp_ratio=mlp_ratio,
                         qkv_bias=qkv_bias,
                         qk_scale=qk_scale,
@@ -371,10 +433,11 @@ class PointTransformerV3(PointModule):
                 )
                 for i in range(dec_depths[s]):
                     dec.add(
-                        Block(
+                        DiPTv3Block(
                             channels=dec_channels[s],
                             num_heads=dec_num_head[s],
                             patch_size=dec_patch_size[s],
+                            t_hidden_size=t_hidden_size,
                             mlp_ratio=mlp_ratio,
                             qkv_bias=qkv_bias,
                             qk_scale=qk_scale,
@@ -408,7 +471,171 @@ class PointTransformerV3(PointModule):
         point.sparsify()
 
         point = self.embedding(point)
+        point.t_emb = self.t_embedder(point.t)
         point = self.enc(point)
         if not self.cls_mode:
             point = self.dec(point)
         return point
+
+
+class FinalLayer(nn.Module):
+    """
+    The final layer of DiT.
+    """
+
+    def __init__(self, hidden_size, t_hidden_size, out_channels):
+        super().__init__()
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, out_channels, bias=True)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(t_hidden_size, 2 * hidden_size, bias=True)
+        )
+
+    @staticmethod
+    def modulate(x, shift, scale):
+        return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+    def forward(self, x, c) -> torch.Tensor:
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        x = self.modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        return x  # type: ignore
+
+
+class DiPTv3Adapter(nn.Module):
+    def __init__(self, model, grid_size=0.001, final_dimension=6):
+        super().__init__()
+        self.model = model
+        self.grid_size = grid_size
+
+        final_input_size = model.dec[-1][-1].mlp[0].fc2.out_features
+        self.final_layer = FinalLayer(
+            final_input_size, model.t_hidden_size, final_dimension
+        )
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+
+        self.apply(_basic_init)
+
+        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
+        # w = self.x_embedder.proj.weight.data
+        # nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        # nn.init.constant_(self.x_embedder.proj.bias, 0)
+
+        # Initialize label embedding table:
+        # nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+
+        # Initialize timestep embedding MLP:
+        nn.init.normal_(self.model.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.model.t_embedder.mlp[2].weight, std=0.02)
+
+        # Zero-out adaLN modulation layers in DiT blocks:
+        for enc in self.model.enc:
+            for block in enc:
+                if hasattr(block, "adaLN_modulation"):
+                    nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                    nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        for dec in self.model.dec:
+            for block in dec:
+                if hasattr(block, "adaLN_modulation"):
+                    nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                    nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        # Zero-out output layers:
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        x0: torch.Tensor,
+        y: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Denoise the input (a point cloud).
+        """
+
+        # Permute to (B, N, C)
+        assert len(x.shape) == 3
+        assert x.shape[1] == 3
+
+        x = x.permute(0, 2, 1)  # type: ignore
+        x0 = x0.permute(0, 2, 1)  # type: ignore
+        if y is not None:
+            y = y.permute(0, 2, 1)
+        B, N, C_in = x.shape
+        B0, N0, D = x0.shape
+        B1, N1, D1 = y.shape if y is not None else (0, 0, 0)
+
+        assert t.shape[0] == B
+
+        if y is not None:
+            # Concatenate y and x0 on the second-to-last dim (N)
+            x0 = torch.cat([x0, y], dim=1)
+            # Add zeros to the x tensor.
+            x = torch.cat([x, torch.zeros(B, N1, C_in, device=x.device)], dim=1)
+
+            # Create a labels tensor (one-hot encoded) for x0 and y.
+            # This is a tensor of shape (B, N0 + N1, 2).
+            labels = torch.cat(
+                [
+                    torch.zeros(B, N0, 1, device=x.device),
+                    torch.ones(B, N1, 1, device=x.device),
+                ],
+                dim=1,
+            )
+            # Make one-hot
+            labels = torch.cat([1 - labels, labels], dim=-1)
+        else:
+            labels = None
+
+        # Reshape to (BxN, C), and create a batch vector with the indices.
+        # Right now assuming that the batch has same number of points for each example.
+        x0_flat = x0.reshape(-1, D)
+        x_flat = x.reshape(-1, C_in)
+        if labels is not None:
+            labels = labels.reshape(-1, labels.shape[-1])
+        batch_ixs = torch.repeat_interleave(
+            torch.arange(B, device=x0.device), x0.shape[1]
+        )
+
+        if y is not None:
+            cat_feat = torch.cat([x0_flat, x_flat, labels], dim=-1)
+        else:
+            cat_feat = torch.cat([x0_flat, x_flat], dim=-1)
+
+        data = Point(
+            coord=x0_flat,
+            feat=cat_feat,
+            batch=batch_ixs,
+            grid_size=self.grid_size,  # Not sure what to do here...
+            t=t,
+            N=N0 + N1,
+        )
+        pred = self.model(data)
+        C_out = pred.feat.shape[-1]
+
+        # Only need the action points.
+        # Reshape back to (B, N, C)
+        feats = pred.feat.reshape(B, -1, C_out)
+
+        # Final linear layer to get the output.
+        feats = self.final_layer(feats, pred.t_emb)
+
+        feats = feats[:, :N, :]
+
+        # Permute back to what we expect.
+        feats = feats.permute(0, 2, 1)
+        return feats  # type: ignore

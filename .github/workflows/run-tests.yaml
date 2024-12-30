@@ -28,8 +28,17 @@ jobs:
           python-version: '3.10'
       ##############################################
 
+      - name: Install torch
+        run: pip install torch==2.5.1 torchvision==0.20.1
+
+      - name: Install torch_scatter
+        run: pip install torch_scatter -f https://data.pyg.org/whl/torch-2.5.0+cpu.html
+
       - name: Install package
         run: pip install "${{ inputs.install_string }}"
+
+      - name: Install spconv.
+        run: pip install spconv
 
       - name: Code Quality
         run: python -m black src/ tests/ --check
